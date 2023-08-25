@@ -29,6 +29,9 @@ pub trait ExecutionMode {
     /// UpgradeCap is produced
     fn packages_are_predefined() -> bool;
 
+    /// Should only be true with DevInspect.
+    fn is_dev_dry_run_mode() -> bool;
+
     fn empty_arguments() -> Self::ArgumentUpdates;
 
     fn empty_results() -> Self::ExecutionResults;
@@ -64,6 +67,10 @@ impl ExecutionMode for Normal {
     }
 
     fn packages_are_predefined() -> bool {
+        false
+    }
+
+    fn is_dev_dry_run_mode() -> bool {
         false
     }
 
@@ -109,6 +116,10 @@ impl ExecutionMode for Genesis {
         true
     }
 
+    fn is_dev_dry_run_mode() -> bool {
+        false
+    }
+
     fn empty_arguments() -> Self::ArgumentUpdates {}
 
     fn empty_results() -> Self::ExecutionResults {}
@@ -152,6 +163,10 @@ impl ExecutionMode for System {
 
     fn packages_are_predefined() -> bool {
         true
+    }
+
+    fn is_dev_dry_run_mode() -> bool {
+        false
     }
 
     fn empty_arguments() -> Self::ArgumentUpdates {}
@@ -201,6 +216,10 @@ impl ExecutionMode for DevInspect {
 
     fn packages_are_predefined() -> bool {
         false
+    }
+
+    fn is_dev_dry_run_mode() -> bool {
+        true
     }
 
     fn empty_arguments() -> Self::ArgumentUpdates {

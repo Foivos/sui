@@ -12,7 +12,7 @@ use move_vm_types::loaded_data::runtime_types::Type;
 use serde::Deserialize;
 
 use crate::{
-    base_types::{ObjectID, SequenceNumber, SuiAddress},
+    base_types::{ObjectID, SequenceNumber, SuiAddress, VersionDigest},
     coin::Coin,
     digests::ObjectDigest,
     error::{ExecutionError, ExecutionErrorKind, SuiError},
@@ -89,7 +89,7 @@ pub struct ExecutionResultsV2 {
     pub written_objects: BTreeMap<ObjectID, Object>,
     /// All objects loaded with the intention to be modified, with their original sequence number and digest.
     /// If any object is not found in written_objects, they must be either deleted or wrapped.
-    pub objects_modified_at: BTreeMap<ObjectID, (SequenceNumber, ObjectDigest)>,
+    pub objects_modified_at: BTreeMap<ObjectID, VersionDigest>,
     /// All object IDs created in this transaction.
     pub created_object_ids: BTreeSet<ObjectID>,
     /// All object IDs deleted in this transaction.

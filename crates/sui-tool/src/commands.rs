@@ -3,11 +3,12 @@
 
 use crate::{
     db_tool::{execute_db_tool_command, print_db_all_tables, DbToolCommand},
-    get_object, get_transaction_block, make_clients, restore_from_db_checkpoint,
-    state_sync_from_archive, verify_archive, verify_archive_by_checksum, ConciseObjectOutput,
-    GroupedObjectOutput, VerboseObjectOutput,
+    download_db_snapshot, get_object, get_transaction_block, make_clients,
+    restore_from_db_checkpoint, state_sync_from_archive, verify_archive,
+    verify_archive_by_checksum, ConciseObjectOutput, GroupedObjectOutput, VerboseObjectOutput,
 };
 use anyhow::Result;
+use std::env;
 use std::path::PathBuf;
 use sui_config::genesis::Genesis;
 use sui_core::authority_client::AuthorityAPI;
@@ -19,7 +20,7 @@ use clap::*;
 use fastcrypto::encoding::Encoding;
 use sui_config::Config;
 use sui_core::authority_aggregator::AuthorityAggregatorBuilder;
-use sui_storage::object_store::ObjectStoreConfig;
+use sui_storage::object_store::{ObjectStoreConfig, ObjectStoreType};
 use sui_types::messages_checkpoint::{
     CheckpointRequest, CheckpointResponse, CheckpointSequenceNumber,
 };
@@ -30,6 +31,12 @@ pub enum Verbosity {
     Grouped,
     Concise,
     Verbose,
+}
+
+#[derive(Parser, Clone, PartialEq, ValueEnum)]
+pub enum Network {
+    Mainnet,
+    Testnet,
 }
 
 #[derive(Parser)]
@@ -200,7 +207,25 @@ pub enum ToolCommand {
         db_checkpoint_path: PathBuf,
     },
 
-    #[command(name = "replay")]
+    #[clap(name = "download-db-snapshot")]
+    DownloadDBSnapshot {
+        #[clap(long = "epoch")]
+        epoch: u32,
+        #[clap(long = "network")]
+        network: Network,
+        #[clap(long = "genesis")]
+        genesis: PathBuf,
+        #[clap(long = "path", default_value = "/tmp")]
+        path: PathBuf,
+        #[clap(long = "skip-checkpoints")]
+        skip_checkpoints: bool,
+        #[clap(long = "skip-indexes")]
+        skip_indexes: bool,
+        #[clap(long = "num-parallel-downloads", default_value = "2")]
+        num_parallel_downloads: usize,
+    },
+
+    #[clap(name = "replay")]
     Replay {
         #[arg(long = "rpc")]
         rpc_url: Option<String>,
@@ -385,6 +410,84 @@ impl ToolCommand {
             } => {
                 let config = sui_config::NodeConfig::load(config_path)?;
                 restore_from_db_checkpoint(&config, &db_checkpoint_path).await?;
+            }
+            ToolCommand::DownloadDBSnapshot {
+                epoch,
+                network,
+                genesis,
+                path,
+                skip_checkpoints,
+                skip_indexes,
+                num_parallel_downloads,
+            } => {
+                let snapshot_store_config = if network == Network::Mainnet {
+                    ObjectStoreConfig {
+                        object_store: Some(ObjectStoreType::S3),
+                        bucket: Some("mysten-mainnet-snapshots".to_string()),
+                        aws_access_key_id: Some(env::var(
+                            "MYSTEN_MAINNET_SNAPSHOTS_ACCESS_KEY_ID",
+                        ).map_err(|_| "Please provide MYSTEN_MAINNET_SNAPSHOTS_ACCESS_KEY_ID as env variable")?),
+                        aws_secret_access_key: Some(env::var(
+                            "MYSTEN_MAINNET_SNAPSHOTS_SECRET_ACCESS_KEY",
+                        ).map_err(|_| "Please provide MYSTEN_MAINNET_SNAPSHOTS_SECRET_ACCESS_KEY as env variable")?),
+                        aws_region: Some("us-west-2".to_string()),
+                        object_store_connection_limit: 200,
+                        ..Default::default()
+                    }
+                } else {
+                    ObjectStoreConfig {
+                        object_store: Some(ObjectStoreType::S3),
+                        bucket: Some("mysten-testnet-snapshots".to_string()),
+                        aws_access_key_id: Some(env::var(
+                            "MYSTEN_TESTNET_SNAPSHOTS_ACCESS_KEY_ID",
+                        ).map_err(|_| "Please provide MYSTEN_TESTNET_SNAPSHOTS_ACCESS_KEY_ID as env variable")?),
+                        aws_secret_access_key: Some(env::var(
+                            "MYSTEN_TESTNET_SNAPSHOTS_SECRET_ACCESS_KEY",
+                        ).map_err(|_| "Please provide MYSTEN_TESTNET_SNAPSHOTS_SECRET_ACCESS_KEY as env variable")?),
+                        aws_region: Some("us-west-2".to_string()),
+                        object_store_connection_limit: 200,
+                        ..Default::default()
+                    }
+                };
+                let archive_store_config = if network == Network::Mainnet {
+                    ObjectStoreConfig {
+                        object_store: Some(ObjectStoreType::S3),
+                        bucket: Some("mysten-mainnet-archives".to_string()),
+                        aws_access_key_id: Some(env::var("MYSTEN_MAINNET_ARCHIVES_ACCESS_KEY_ID")
+                            .map_err(|_| "Please provide MYSTEN_MAINNET_ARCHIVES_ACCESS_KEY_ID as env variable")?),
+                        aws_secret_access_key: Some(env::var(
+                            "MYSTEN_MAINNET_ARCHIVES_SECRET_ACCESS_KEY",
+                        ).map_err(|_| "Please provide MYSTEN_MAINNET_ARCHIVES_SECRET_ACCESS_KEY as env variable")?),
+                        aws_region: Some("us-west-2".to_string()),
+                        object_store_connection_limit: 200,
+                        ..Default::default()
+                    }
+                } else {
+                    ObjectStoreConfig {
+                        object_store: Some(ObjectStoreType::S3),
+                        bucket: Some("mysten-testnet-archives".to_string()),
+                        aws_access_key_id: Some(env::var(
+                            "MYSTEN_TESTNET_ARCHIVES_ACCESS_KEY_ID",
+                        ).map_err(|_| "Please provide MYSTEN_TESTNET_ARCHIVES_ACCESS_KEY_ID as env variable")?),
+                        aws_secret_access_key: Some(env::var(
+                            "MYSTEN_TESTNET_ARCHIVES_SECRET_ACCESS_KEY",
+                        ).map_err(|_| "Please provide MYSTEN_TESTNET_ARCHIVES_SECRET_ACCESS_KEY as env variable")?),
+                        aws_region: Some("us-west-2".to_string()),
+                        object_store_connection_limit: 200,
+                        ..Default::default()
+                    }
+                };
+                download_db_snapshot(
+                    &path,
+                    epoch,
+                    &genesis,
+                    snapshot_store_config,
+                    archive_store_config,
+                    skip_checkpoints,
+                    skip_indexes,
+                    num_parallel_downloads,
+                )
+                .await?;
             }
             ToolCommand::Replay {
                 rpc_url,

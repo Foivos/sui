@@ -14,10 +14,10 @@ use sui_protocol_config::ProtocolConfig;
 use sui_types::base_types::VersionDigest;
 use sui_types::committee::EpochId;
 use sui_types::effects::{TransactionEffects, TransactionEvents};
-use sui_types::execution::{ExecutionResults, LoadedChildObjectMetadata};
+use sui_types::execution::{ExecutionResults, ExecutionResultsV2, LoadedChildObjectMetadata};
 use sui_types::execution_status::ExecutionStatus;
 use sui_types::inner_temporary_store::InnerTemporaryStore;
-use sui_types::storage::{BackingStore, DeleteKindWithOldVersion};
+use sui_types::storage::BackingStore;
 use sui_types::sui_system_state::{get_sui_system_state_wrapper, AdvanceEpochParams};
 use sui_types::type_resolver::LayoutResolver;
 use sui_types::{
@@ -25,14 +25,11 @@ use sui_types::{
         ObjectDigest, ObjectID, ObjectRef, SequenceNumber, SuiAddress, TransactionDigest,
     },
     error::{ExecutionError, SuiError, SuiResult},
-    event::Event,
     fp_bail,
     gas::GasCostSummary,
     object::Owner,
     object::{Data, Object},
-    storage::{
-        BackingPackageStore, ChildObjectResolver, ObjectChange, ParentSync, Storage, WriteKind,
-    },
+    storage::{BackingPackageStore, ChildObjectResolver, ParentSync, Storage},
     transaction::InputObjects,
 };
 use sui_types::{is_system_package, SUI_SYSTEM_STATE_OBJECT_ID};
@@ -49,17 +46,10 @@ pub struct TemporaryStore<'backing> {
     /// The version to assign to all objects written by the transaction using this store.
     lamport_timestamp: SequenceNumber,
     mutable_input_refs: BTreeMap<ObjectID, VersionDigest>, // Inputs that are mutable
-    // When an object is being written, we need to ensure that a few invariants hold.
-    // It's critical that we always call write_object to update `written`, instead of writing
-    // into written directly.
-    written: BTreeMap<ObjectID, (Object, WriteKind)>, // Objects written
-    /// Objects actively deleted.
-    deleted: BTreeMap<ObjectID, DeleteKindWithOldVersion>,
+    execution_results: ExecutionResultsV2,
     /// Child objects loaded during dynamic field opers
     /// Currently onply populated for full nodes, not for validators
     loaded_child_objects: BTreeMap<ObjectID, LoadedChildObjectMetadata>,
-    /// Ordered sequence of events emitted by execution
-    events: Vec<Event>,
     protocol_config: ProtocolConfig,
 
     /// Every package that was loaded from DB store during execution.
@@ -85,9 +75,7 @@ impl<'backing> TemporaryStore<'backing> {
             input_objects: objects,
             lamport_timestamp,
             mutable_input_refs,
-            written: BTreeMap::new(),
-            deleted: BTreeMap::new(),
-            events: Vec::new(),
+            execution_results: ExecutionResultsV2::default(),
             protocol_config: protocol_config.clone(),
             loaded_child_objects: BTreeMap::new(),
             runtime_packages_loaded_from_db: RwLock::new(BTreeMap::new()),
@@ -115,9 +103,7 @@ impl<'backing> TemporaryStore<'backing> {
             input_objects: objects,
             lamport_timestamp,
             mutable_input_refs,
-            written: BTreeMap::new(),
-            deleted: BTreeMap::new(),
-            events: Vec::new(),
+            execution_results: ExecutionResultsV2::default(),
             protocol_config: protocol_config.clone(),
             loaded_child_objects: BTreeMap::new(),
             runtime_packages_loaded_from_db: RwLock::new(BTreeMap::new()),
@@ -130,59 +116,25 @@ impl<'backing> TemporaryStore<'backing> {
     }
 
     pub fn update_object_version_and_prev_tx(&mut self) {
+        self.execution_results
+            .update_version_and_previous_tx(self.lamport_timestamp, self.tx_digest);
+
         #[cfg(debug_assertions)]
         {
             self.check_invariants();
-        }
-
-        for (id, (obj, kind)) in self.written.iter_mut() {
-            // Update the version for the written object.
-            match &mut obj.data {
-                Data::Move(obj) => {
-                    // Move objects all get the transaction's lamport timestamp
-                    obj.increment_version_to(self.lamport_timestamp);
-                }
-
-                Data::Package(pkg) => {
-                    // Modified packages get their version incremented (this is a special case that
-                    // only applies to system packages).  All other packages can only be created,
-                    // and they are left alone.
-                    if *kind == WriteKind::Mutate {
-                        pkg.increment_version();
-                    }
-                }
-            }
-
-            // Record the version that the shared object was created at in its owner field.  Note,
-            // this only works because shared objects must be created as shared (not created as
-            // owned in one transaction and later converted to shared in another).
-            if let Owner::Shared {
-                initial_shared_version,
-            } = &mut obj.owner
-            {
-                if *kind == WriteKind::Create {
-                    assert_eq!(
-                        *initial_shared_version,
-                        SequenceNumber::new(),
-                        "Initial version should be blank before this point for {id:?}",
-                    );
-                    *initial_shared_version = self.lamport_timestamp;
-                }
-            }
         }
     }
 
     /// Break up the structure and return its internal stores (objects, active_inputs, written, deleted)
     pub fn into_inner(self) -> InnerTemporaryStore {
+        let results = self.execution_results;
         InnerTemporaryStore {
             input_objects: self.input_objects,
             mutable_inputs: self.mutable_input_refs,
-            written: self
-                .written
-                .into_iter()
-                .map(|(id, (obj, _))| (id, obj))
-                .collect(),
-            events: TransactionEvents { data: self.events },
+            written: results.written_objects,
+            events: TransactionEvents {
+                data: results.user_events,
+            },
             max_binary_format_version: self.protocol_config.move_binary_format_version(),
             loaded_child_objects: self
                 .loaded_child_objects
@@ -200,7 +152,7 @@ impl<'backing> TemporaryStore<'backing> {
     pub(crate) fn ensure_active_inputs_mutated(&mut self) {
         let mut to_be_updated = vec![];
         for id in self.mutable_input_refs.keys() {
-            if !self.written.contains_key(id) && !self.deleted.contains_key(id) {
+            if !self.execution_results.objects_modified_at.contains_key(id) {
                 // We cannot update here but have to push to `to_be_updated` and update later
                 // because the for loop is holding a reference to `self`, and calling
                 // `self.write_object` requires a mutable reference to `self`.
@@ -209,7 +161,7 @@ impl<'backing> TemporaryStore<'backing> {
         }
         for object in to_be_updated {
             // The object must be mutated as it was present in the input objects
-            self.write_object(object, WriteKind::Mutate);
+            self.mutate_input_object(object);
         }
     }
 
@@ -223,54 +175,14 @@ impl<'backing> TemporaryStore<'backing> {
         gas_charger: &mut GasCharger,
         epoch: EpochId,
     ) -> (InnerTemporaryStore, TransactionEffects) {
-        let mut modified_at_versions = vec![];
-
-        // Remember the versions objects were updated from in case of rollback.
-        self.written.iter_mut().for_each(|(id, (obj, kind))| {
-            if *kind == WriteKind::Mutate {
-                modified_at_versions.push((*id, obj.version()))
-            }
-        });
-
-        self.deleted.iter_mut().for_each(|(id, kind)| {
-            if let Some(version) = kind.old_version() {
-                modified_at_versions.push((*id, version));
-            }
-        });
-
         self.update_object_version_and_prev_tx();
-
-        let mut deleted = vec![];
-        let mut wrapped = vec![];
-        let mut unwrapped_then_deleted = vec![];
-        for (id, kind) in &self.deleted {
-            match kind {
-                DeleteKindWithOldVersion::Normal(_) => deleted.push((
-                    *id,
-                    self.lamport_timestamp,
-                    ObjectDigest::OBJECT_DIGEST_DELETED,
-                )),
-                DeleteKindWithOldVersion::UnwrapThenDelete
-                | DeleteKindWithOldVersion::UnwrapThenDeleteDEPRECATED(_) => unwrapped_then_deleted
-                    .push((
-                        *id,
-                        self.lamport_timestamp,
-                        ObjectDigest::OBJECT_DIGEST_DELETED,
-                    )),
-                DeleteKindWithOldVersion::Wrap(_) => wrapped.push((
-                    *id,
-                    self.lamport_timestamp,
-                    ObjectDigest::OBJECT_DIGEST_WRAPPED,
-                )),
-            }
-        }
 
         // In the case of special transactions that don't require a gas object,
         // we don't really care about the effects to gas, just use the input for it.
         // Gas coins are guaranteed to be at least size 1 and if more than 1
         // the first coin is where all the others are merged.
         let updated_gas_object_info = if let Some(coin_id) = gas_charger.gas_coin() {
-            let object = &self.written[&coin_id].0;
+            let object = &self.execution_results.written_objects[&coin_id];
             (object.compute_object_reference(), object.owner)
         } else {
             (
@@ -279,36 +191,22 @@ impl<'backing> TemporaryStore<'backing> {
             )
         };
 
-        let mut mutated = vec![];
-        let mut created = vec![];
-        let mut unwrapped = vec![];
-        for (object, kind) in self.written.values() {
-            // TODO: We should cache the object ref when we update the object for the last time.
-            let object_ref = object.compute_object_reference();
-            match kind {
-                WriteKind::Mutate => mutated.push((object_ref, object.owner)),
-                WriteKind::Create => created.push((object_ref, object.owner)),
-                WriteKind::Unwrap => unwrapped.push((object_ref, object.owner)),
-            }
-        }
+        let object_changes = self.execution_results.get_object_changes();
 
+        let lamport_version = self.lamport_timestamp;
         let protocol_version = self.protocol_config.version;
         let inner = self.into_inner();
 
-        let effects = TransactionEffects::new_from_execution(
+        let effects = TransactionEffects::new_from_execution_v2(
             protocol_version,
             status,
             epoch,
             gas_cost_summary,
-            modified_at_versions,
+            // TODO: Get rid of shared_objects here.
             shared_object_refs,
             *transaction_digest,
-            created,
-            mutated,
-            unwrapped,
-            deleted,
-            unwrapped_then_deleted,
-            wrapped,
+            lamport_version,
+            object_changes,
             updated_gas_object_info,
             if inner.events.data.is_empty() {
                 None
@@ -326,133 +224,122 @@ impl<'backing> TemporaryStore<'backing> {
         // Check not both deleted and written
         debug_assert!(
             {
-                let mut used = HashSet::new();
-                self.written.iter().all(|(elt, _)| used.insert(elt));
-                self.deleted.iter().all(move |elt| used.insert(elt.0))
+                self.execution_results
+                    .written_objects
+                    .keys()
+                    .all(|id| !self.execution_results.deleted_object_ids.contains(id))
             },
             "Object both written and deleted."
         );
 
-        // Check all mutable inputs are either written or deleted
+        // Check all mutable inputs are modified
         debug_assert!(
             {
-                let mut used = HashSet::new();
-                self.written.iter().all(|(elt, _)| used.insert(elt));
-                self.deleted.iter().all(|elt| used.insert(elt.0));
-
-                self.mutable_input_refs.keys().all(|elt| !used.insert(elt))
+                self.mutable_input_refs
+                    .keys()
+                    .all(|id| self.execution_results.objects_modified_at.contains_key(id))
             },
-            "Mutable input neither written nor deleted."
+            "Mutable input not modified."
         );
 
         debug_assert!(
             {
-                self.written
-                    .iter()
-                    .all(|(_, (obj, _))| obj.previous_transaction == self.tx_digest)
+                self.execution_results
+                    .written_objects
+                    .values()
+                    .all(|obj| obj.previous_transaction == self.tx_digest)
             },
             "Object previous transaction not properly set",
         );
-
-        if self.protocol_config.simplified_unwrap_then_delete() {
-            debug_assert!(self.deleted.iter().all(|(_, kind)| {
-                !matches!(
-                    kind,
-                    DeleteKindWithOldVersion::UnwrapThenDeleteDEPRECATED(_)
-                )
-            }));
-        } else {
-            debug_assert!(self
-                .deleted
-                .iter()
-                .all(|(_, kind)| { !matches!(kind, DeleteKindWithOldVersion::UnwrapThenDelete) }));
-        }
     }
 
-    // Invariant: A key assumption of the write-delete logic
-    // is that an entry is not both added and deleted by the
-    // caller.
+    /// Mutate a mutable input object. This is used to mutate input objects outside of Move execution.
+    pub fn mutate_input_object(&mut self, object: Object) {
+        let id = object.id();
+        let input_object = self.mutable_input_refs.get(&id).unwrap();
+        self.execution_results
+            .objects_modified_at
+            .insert(id, *input_object);
+        self.execution_results.written_objects.insert(id, object);
+    }
 
-    pub fn write_object(&mut self, mut object: Object, kind: WriteKind) {
-        // there should be no write after delete
-        debug_assert!(self.deleted.get(&object.id()).is_none());
-        // Check it is not read-only
-        #[cfg(test)] // Movevm should ensure this
-        if let Some(existing_object) = self.read_object(&object.id()) {
-            if existing_object.is_immutable() {
-                // This is an internal invariant violation. Move only allows us to
-                // mutate objects if they are &mut so they cannot be read-only.
-                panic!("Internal invariant violation: Mutating a read-only object.")
-            }
-        }
+    /// Mutate a child object outside of Move. This should be used extremely rarely.
+    /// Currently it's only used by advance_epoch_safe_mode because it's all native
+    /// without Move. Please don't use this unless you know what you are doing.
+    pub fn mutate_child_object(&mut self, old_object: Object, new_object: Object) {
+        let id = new_object.id();
+        let old_ref = old_object.compute_object_reference();
+        debug_assert_eq!(old_ref.0, id);
+        self.loaded_child_objects.insert(
+            id,
+            LoadedChildObjectMetadata {
+                version: old_ref.1,
+                digest: old_ref.2,
+                storage_rebate: old_object.storage_rebate,
+            },
+        );
+        self.execution_results
+            .objects_modified_at
+            .insert(id, (old_object.version(), old_object.digest()));
+        self.execution_results
+            .written_objects
+            .insert(id, new_object);
+    }
 
+    pub fn upgrade_system_package(&mut self, package: Object) {
+        let id = package.id();
+        debug_assert!(package.is_package());
+        let old_obj = self
+            .store
+            .get_object(&id)
+            .unwrap()
+            .expect("When upgrading a system package, the current version must exists");
+        self.execution_results
+            .objects_modified_at
+            .insert(id, (old_obj.version(), old_obj.digest()));
+        self.execution_results.written_objects.insert(id, package);
+    }
+
+    /// Crate a new objcet. This is used to create objects outside of Move execution.
+    pub fn create_object(&mut self, object: Object) {
         // Created mutable objects' versions are set to the store's lamport timestamp when it is
         // committed to effects. Creating an object at a non-zero version risks violating the
         // lamport timestamp invariant (that a transaction's lamport timestamp is strictly greater
         // than all versions witnessed by the transaction).
         debug_assert!(
-            kind != WriteKind::Create
-                || object.is_immutable()
-                || object.version() == SequenceNumber::MIN,
+            object.is_immutable() || object.version() == SequenceNumber::MIN,
             "Created mutable objects should not have a version set",
         );
-
-        // The adapter is not very disciplined at filling in the correct
-        // previous transaction digest, so we ensure it is correct here.
-        object.previous_transaction = self.tx_digest;
-        self.written.insert(object.id(), (object, kind));
+        let id = object.id();
+        self.execution_results.created_object_ids.insert(id);
+        self.execution_results.written_objects.insert(id, object);
     }
 
-    pub fn delete_object(&mut self, id: &ObjectID, kind: DeleteKindWithOldVersion) {
+    /// Delete a mutable input object. This is used to delete input objects outside of Move execution.
+    pub fn delete_input_object(&mut self, id: &ObjectID) {
         // there should be no deletion after write
-        debug_assert!(self.written.get(id).is_none());
+        debug_assert!(!self.execution_results.written_objects.contains_key(id));
 
-        // TODO: promote this to an on-in-prod check that raises an invariant_violation
-        // Check that we are not deleting an immutable object
-        #[cfg(debug_assertions)]
-        if let Some(object) = self.read_object(id) {
-            if object.is_immutable() {
-                // This is an internal invariant violation. Move only allows us to
-                // mutate objects if they are &mut so they cannot be read-only.
-                // In addition, gas objects should never be immutable, so gas smashing
-                // should not allow us to delete immutable objects
-                let digest = self.tx_digest;
-                panic!("Internal invariant violation in tx {digest}: Deleting immutable object {id}, delete kind {kind:?}")
-            }
-        }
-
-        // For object deletion, we will increment the version when converting the store to effects
-        // so the object will eventually show up in the parent_sync table with a new version.
-        self.deleted.insert(*id, kind);
+        let input_object = self.mutable_input_refs.get(id).unwrap();
+        self.execution_results
+            .objects_modified_at
+            .insert(*id, *input_object);
+        self.execution_results.deleted_object_ids.insert(*id);
     }
 
     pub fn drop_writes(&mut self) {
-        self.written.clear();
-        self.deleted.clear();
-        self.events.clear();
-    }
-
-    pub fn log_event(&mut self, event: Event) {
-        self.events.push(event)
+        self.execution_results.drop_writes();
     }
 
     pub fn read_object(&self, id: &ObjectID) -> Option<&Object> {
         // there should be no read after delete
-        debug_assert!(self.deleted.get(id).is_none());
-        self.written
+        debug_assert!(!self.execution_results.deleted_object_ids.contains(id));
+        self.execution_results
+            .written_objects
             .get(id)
-            .map(|(obj, _kind)| obj)
             .or_else(|| self.input_objects.get(id))
     }
 
-    pub fn apply_object_changes(&mut self, changes: BTreeMap<ObjectID, ObjectChange>) {
-        for (id, change) in changes {
-            match change {
-                ObjectChange::Write(new_value, kind) => self.write_object(new_value, kind),
-                ObjectChange::Delete(kind) => self.delete_object(&id, kind),
-            }
-        }
-    }
     pub fn save_loaded_child_objects(
         &mut self,
         loaded_child_objects: BTreeMap<ObjectID, LoadedChildObjectMetadata>,
@@ -475,24 +362,39 @@ impl<'backing> TemporaryStore<'backing> {
         self.loaded_child_objects.extend(loaded_child_objects);
     }
 
+    // TODO: Simplify this logic for effects v2.
     pub fn estimate_effects_size_upperbound(&self) -> usize {
+        let num_deletes = self.execution_results.deleted_object_ids.len()
+            + self
+                .execution_results
+                .objects_modified_at
+                .keys()
+                .filter(|id| {
+                    // Filter for wrapped objects.
+                    !self.execution_results.written_objects.contains_key(id)
+                        && !self.execution_results.deleted_object_ids.contains(id)
+                })
+                .count();
         // In the worst case, the number of deps is equal to the number of input objects
         TransactionEffects::estimate_effects_size_upperbound(
-            self.written.len(),
+            self.execution_results.written_objects.len(),
             self.mutable_input_refs.len(),
-            self.deleted.len(),
+            num_deletes,
             self.input_objects.len(),
         )
     }
 
     pub fn written_objects_size(&self) -> usize {
-        self.written
-            .iter()
-            .fold(0, |sum, obj| sum + obj.1 .0.object_size_for_gas_metering())
+        self.execution_results
+            .written_objects
+            .values()
+            .fold(0, |sum, obj| sum + obj.object_size_for_gas_metering())
     }
 
     /// If there are unmetered storage rebate (due to system transaction), we put them into
     /// the storage rebate of 0x5 object.
+    /// TODO: This will not work for potential future new system transactions if 0x5 is not in the input.
+    /// We should fix this.
     pub fn conserve_unmetered_storage_rebate(&mut self, unmetered_storage_rebate: u64) {
         if unmetered_storage_rebate == 0 {
             // If unmetered_storage_rebate is 0, we are most likely executing the genesis transaction.
@@ -512,7 +414,7 @@ impl<'backing> TemporaryStore<'backing> {
         // If not, we would be dropping SUI on the floor by overriding it.
         assert_eq!(system_state_wrapper.storage_rebate, 0);
         system_state_wrapper.storage_rebate = unmetered_storage_rebate;
-        self.write_object(system_state_wrapper, WriteKind::Mutate);
+        self.mutate_input_object(system_state_wrapper);
     }
 }
 
@@ -561,64 +463,28 @@ impl<'backing> TemporaryStore<'backing> {
             }
         }
 
-        for (id, (_new_obj, kind)) in &self.written {
+        for id in self.execution_results.objects_modified_at.keys() {
             if authenticated_objs.contains(id) || gas_objs.contains(id) {
                 continue;
             }
-            match kind {
-                WriteKind::Mutate => {
-                    // get owner at beginning of tx, since that's what we have to authenticate against
-                    // _new_obj.owner is not relevant here
-                    let old_obj = self.store.get_object(id)?.unwrap_or_else(|| {
-                        panic!("Mutated object must exist in the store: ID = {:?}", id)
-                    });
-                    match &old_obj.owner {
-                        Owner::ObjectOwner(_parent) => {
-                            objs_to_authenticate.push(*id);
-                        }
-                        Owner::AddressOwner(_) | Owner::Shared { .. } => {
-                            unreachable!("Should already be in authenticated_objs")
-                        }
-                        Owner::Immutable => {
-                            assert!(is_epoch_change, "Immutable objects cannot be written, except for Sui Framework/Move stdlib upgrades at epoch change boundaries");
-                            // Note: this assumes that the only immutable objects an epoch change tx can update are system packages,
-                            // but in principle we could allow others.
-                            assert!(
-                                is_system_package(*id),
-                                "Only system packages can be upgraded"
-                            );
-                        }
-                    }
+            let old_obj = self.store.get_object(id)?.unwrap_or_else(|| {
+                panic!("Modified object must exist in the store: ID = {:?}", id)
+            });
+            match &old_obj.owner {
+                Owner::ObjectOwner(_parent) => {
+                    objs_to_authenticate.push(*id);
                 }
-                WriteKind::Create | WriteKind::Unwrap => {
-                    // created and unwrapped objects were not inputs to the tx
-                    // or dynamic fields accessed at runtime, no ownership checks needed
+                Owner::AddressOwner(_) | Owner::Shared { .. } => {
+                    unreachable!("Should already be in authenticated_objs")
                 }
-            }
-        }
-
-        for (id, kind) in &self.deleted {
-            if authenticated_objs.contains(id) || gas_objs.contains(id) {
-                continue;
-            }
-            match kind {
-                DeleteKindWithOldVersion::Normal(_) | DeleteKindWithOldVersion::Wrap(_) => {
-                    // get owner at beginning of tx
-                    let old_obj = self.store.get_object(id)?.unwrap();
-                    match &old_obj.owner {
-                        Owner::ObjectOwner(_) => {
-                            objs_to_authenticate.push(*id);
-                        }
-                        Owner::AddressOwner(_) | Owner::Shared { .. } => {
-                            unreachable!("Should already be in authenticated_objs")
-                        }
-                        Owner::Immutable => unreachable!("Immutable objects cannot be deleted"),
-                    }
-                }
-                DeleteKindWithOldVersion::UnwrapThenDelete
-                | DeleteKindWithOldVersion::UnwrapThenDeleteDEPRECATED(_) => {
-                    // unwrapped-then-deleted object was not an input to the tx,
-                    // no ownership checks needed
+                Owner::Immutable => {
+                    assert!(is_epoch_change, "Immutable objects cannot be written, except for Sui Framework/Move stdlib upgrades at epoch change boundaries");
+                    // Note: this assumes that the only immutable objects an epoch change tx can update are system packages,
+                    // but in principle we could allow others.
+                    assert!(
+                        is_system_package(*id),
+                        "Only system packages can be upgraded"
+                    );
                 }
             }
         }
@@ -695,14 +561,24 @@ impl<'backing> TemporaryStore<'backing> {
     pub(crate) fn collect_storage_and_rebate(&mut self, gas_charger: &mut GasCharger) {
         // Use two loops because we cannot mut iterate written while calling get_input_storage_rebate.
         let old_storage_rebates: Vec<_> = self
-            .written
-            .iter()
-            .map(|(object_id, (object, write_kind))| match write_kind {
-                WriteKind::Create | WriteKind::Unwrap => 0,
-                WriteKind::Mutate => self.get_input_storage_rebate(object_id, object.version()),
+            .execution_results
+            .written_objects
+            .keys()
+            .map(|object_id| {
+                if let Some((version, _)) =
+                    self.execution_results.objects_modified_at.get(object_id)
+                {
+                    self.get_input_storage_rebate(object_id, *version)
+                } else {
+                    0
+                }
             })
             .collect();
-        for ((object, _), old_storage_rebate) in self.written.values_mut().zip(old_storage_rebates)
+        for (object, old_storage_rebate) in self
+            .execution_results
+            .written_objects
+            .values_mut()
+            .zip(old_storage_rebates)
         {
             // new object size
             let new_object_size = object.object_size_for_gas_metering();
@@ -716,19 +592,17 @@ impl<'backing> TemporaryStore<'backing> {
     }
 
     pub(crate) fn collect_rebate(&self, gas_charger: &mut GasCharger) {
-        for (object_id, kind) in &self.deleted {
-            match kind {
-                DeleteKindWithOldVersion::Wrap(version)
-                | DeleteKindWithOldVersion::Normal(version) => {
-                    // get and track the deleted object `storage_rebate`
-                    let storage_rebate = self.get_input_storage_rebate(object_id, *version);
-                    gas_charger.track_storage_mutation(0, storage_rebate);
-                }
-                DeleteKindWithOldVersion::UnwrapThenDelete
-                | DeleteKindWithOldVersion::UnwrapThenDeleteDEPRECATED(_) => {
-                    // an unwrapped object does not have a storage rebate, we will charge for storage changes via its wrapper object
-                }
+        for (object_id, (version, _)) in &self.execution_results.objects_modified_at {
+            if self
+                .execution_results
+                .written_objects
+                .contains_key(object_id)
+            {
+                continue;
             }
+            // get and track the deleted object `storage_rebate`
+            let storage_rebate = self.get_input_storage_rebate(object_id, *version);
+            gas_charger.track_storage_mutation(0, storage_rebate);
         }
     }
 }
@@ -744,9 +618,9 @@ impl<'backing> TemporaryStore<'backing> {
     ) {
         let wrapper = get_sui_system_state_wrapper(self.store.as_object_store())
             .expect("System state wrapper object must exist");
-        let new_object =
+        let (old_object, new_object) =
             wrapper.advance_epoch_safe_mode(params, self.store.as_object_store(), protocol_config);
-        self.write_object(new_object, WriteKind::Mutate);
+        self.mutate_child_object(old_object, new_object);
     }
 }
 
@@ -798,26 +672,26 @@ impl<'backing> TemporaryStore<'backing> {
     /// - Input: If the object existed prior to this transaction, include their version and storage_rebate,
     /// - Output: If a new version of the object is written, include the new object.
     fn get_modified_objects(&self) -> Vec<ModifiedObjectInfo<'_>> {
-        self.written
+        self.execution_results
+            .objects_modified_at
             .iter()
-            .map(|(id, (object, kind))| match kind {
-                WriteKind::Mutate => {
-                    // When an object is mutated, its version remains the old version until the end.
-                    let version = object.version();
-                    let storage_rebate = self.get_input_storage_rebate(id, version);
-                    (*id, Some((object.version(), storage_rebate)), Some(object))
-                }
-                WriteKind::Create | WriteKind::Unwrap => (*id, None, Some(object)),
+            .map(|(id, (version, _))| {
+                let storage_rebate = self.get_input_storage_rebate(id, *version);
+                let output = self.execution_results.written_objects.get(id);
+                (*id, Some((*version, storage_rebate)), output)
             })
-            .chain(self.deleted.iter().filter_map(|(id, kind)| match kind {
-                DeleteKindWithOldVersion::Normal(version)
-                | DeleteKindWithOldVersion::Wrap(version) => {
-                    let storage_rebate = self.get_input_storage_rebate(id, *version);
-                    Some((*id, Some((*version, storage_rebate)), None))
-                }
-                DeleteKindWithOldVersion::UnwrapThenDelete
-                | DeleteKindWithOldVersion::UnwrapThenDeleteDEPRECATED(_) => None,
-            }))
+            .chain(
+                self.execution_results
+                    .written_objects
+                    .iter()
+                    .filter_map(|(id, object)| {
+                        if self.execution_results.objects_modified_at.contains_key(id) {
+                            None
+                        } else {
+                            Some((*id, None, Some(object)))
+                        }
+                    }),
+            )
             .collect()
     }
 
@@ -968,9 +842,7 @@ impl<'backing> ChildObjectResolver for TemporaryStore<'backing> {
         child: &ObjectID,
         child_version_upper_bound: SequenceNumber,
     ) -> SuiResult<Option<Object>> {
-        // there should be no read after delete
-        debug_assert!(self.deleted.get(child).is_none());
-        let obj_opt = self.written.get(child).map(|(obj, _kind)| obj);
+        let obj_opt = self.execution_results.written_objects.get(child);
         if obj_opt.is_some() {
             Ok(obj_opt.cloned())
         } else {
@@ -982,9 +854,7 @@ impl<'backing> ChildObjectResolver for TemporaryStore<'backing> {
 
 impl<'backing> Storage for TemporaryStore<'backing> {
     fn reset(&mut self) {
-        self.written.clear();
-        self.deleted.clear();
-        self.events.clear();
+        self.drop_writes();
     }
 
     fn read_object(&self, id: &ObjectID) -> Option<&Object> {
@@ -996,37 +866,9 @@ impl<'backing> Storage for TemporaryStore<'backing> {
         let ExecutionResults::V2(results) = results else {
             panic!("ExecutionResults::V2 expected in sui-execution v1 and above");
         };
-        let mut object_changes = BTreeMap::new();
-        for (id, object) in results.written_objects {
-            let write_kind = if results.created_object_ids.contains(&id) {
-                WriteKind::Create
-            } else if results.objects_modified_at.contains_key(&id) {
-                WriteKind::Mutate
-            } else {
-                WriteKind::Unwrap
-            };
-            object_changes.insert(id, ObjectChange::Write(object, write_kind));
-        }
-
-        for id in results.deleted_object_ids {
-            let delete_kind: DeleteKindWithOldVersion =
-                if let Some((version, _)) = results.objects_modified_at.get(&id) {
-                    DeleteKindWithOldVersion::Normal(*version)
-                } else {
-                    DeleteKindWithOldVersion::UnwrapThenDelete
-                };
-            object_changes.insert(id, ObjectChange::Delete(delete_kind));
-        }
-        for (id, (version, _)) in results.objects_modified_at {
-            object_changes.entry(id).or_insert(ObjectChange::Delete(
-                DeleteKindWithOldVersion::Wrap(version),
-            ));
-        }
-        self.apply_object_changes(object_changes);
-
-        for event in results.user_events {
-            self.events.push(event);
-        }
+        // It's important to merge instead of override results because it's
+        // possible to execute Move runtime more than once during tx execution.
+        self.execution_results.merge_results(results);
     }
 
     fn save_loaded_child_objects(
@@ -1039,7 +881,7 @@ impl<'backing> Storage for TemporaryStore<'backing> {
 
 impl<'backing> BackingPackageStore for TemporaryStore<'backing> {
     fn get_package_object(&self, package_id: &ObjectID) -> SuiResult<Option<Object>> {
-        if let Some((obj, _)) = self.written.get(package_id) {
+        if let Some(obj) = self.execution_results.written_objects.get(package_id) {
             Ok(Some(obj.clone()))
         } else {
             self.store.get_package_object(package_id).map(|obj| {
@@ -1138,7 +980,7 @@ impl<'backing> GetModule for TemporaryStore<'backing> {
 
     fn get_module_by_id(&self, module_id: &ModuleId) -> Result<Option<Self::Item>, Self::Error> {
         let package_id = &ObjectID::from(*module_id.address());
-        if let Some((obj, _)) = self.written.get(package_id) {
+        if let Some(obj) = self.execution_results.written_objects.get(package_id) {
             Ok(Some(
                 obj.data
                     .try_as_package()

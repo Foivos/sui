@@ -1033,7 +1033,7 @@ impl AuthorityStore {
         _epoch_id: EpochId,
     ) -> SuiResult {
         let InnerTemporaryStore {
-            objects,
+            input_objects: objects,
             mutable_inputs: active_inputs,
             written,
             events,

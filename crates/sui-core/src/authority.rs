@@ -1090,7 +1090,7 @@ impl AuthorityState {
         let _scope: Option<mysten_metrics::MonitoredScopeGuard> =
             monitored_scope("Execution::commit_cert_and_notify");
 
-        let input_object_count = inner_temporary_store.objects.len();
+        let input_object_count = inner_temporary_store.input_objects.len();
         let shared_object_count = effects.input_shared_objects().len();
         let digest = *certificate.digest();
 
@@ -3336,7 +3336,7 @@ impl AuthorityState {
             })
             .collect();
         let input_coin_objects = inner_temporary_store
-            .objects
+            .input_objects
             .iter()
             .filter_map(|(k, v)| {
                 if v.is_coin() {
@@ -4302,7 +4302,11 @@ impl NodeStateDump {
             modified_at_versions,
             runtime_reads,
             sender_signed_data: certificate.clone().into_message(),
-            input_objects: inner_temporary_store.objects.values().cloned().collect(),
+            input_objects: inner_temporary_store
+                .input_objects
+                .values()
+                .cloned()
+                .collect(),
             computed_effects: effects.clone(),
             expected_effects_digest,
         })

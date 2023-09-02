@@ -837,7 +837,7 @@ fn create_genesis_transaction(
                 genesis_digest,
                 transaction_dependencies,
             );
-        assert!(inner_temp_store.objects.is_empty());
+        assert!(inner_temp_store.input_objects.is_empty());
         assert!(inner_temp_store.mutable_inputs.is_empty());
         assert!(effects.mutated().is_empty());
         assert!(effects.unwrapped().is_empty());

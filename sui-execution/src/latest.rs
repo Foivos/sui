@@ -192,6 +192,7 @@ impl executor::Executor for Executor {
             &mut gas_charger,
             pt,
         )?;
+        temporary_store.update_object_version_and_prev_tx();
         Ok(temporary_store.into_inner())
     }
 

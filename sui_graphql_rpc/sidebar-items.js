@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["schema_sdl_export"],"mod":["commands","error","extensions","server","types"]};
